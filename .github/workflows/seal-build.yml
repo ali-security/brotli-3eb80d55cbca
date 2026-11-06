@@ -1,0 +1,102 @@
+name: seal-build
+
+# Authored by Seal: upstream github.com/andybalholm/brotli ships no CI at all.
+# Builds the Go module zip exactly as proxy.golang.org serves it and runs the
+# package's own test suite (`go test ./...`).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regex; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELPER="$(mktemp -d)"
+          cd "$HELPER"
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[1])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: "github.com/andybalholm/brotli", Version: "v1.2.2"}
+              if err := zip.CreateFromDir(f, mv, os.Args[2]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go build -o "$HELPER/mkzip" .
+          # Seal's workflow is the only .github content; upstream ships none.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          mkdir -p "$RUNNER_TEMP/out"
+          "$HELPER/mkzip" "$RUNNER_TEMP/out/v1.2.2.zip" "$GITHUB_WORKSPACE"
+          unzip -l "$RUNNER_TEMP/out/v1.2.2.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.2.2.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        go: ["1.22", "1.23"]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Build
+        shell: bash
+        run: |
+          go version
+          go build ./...
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          TF="${{ inputs.test-filter }}"
+          if [ -n "$TF" ]; then
+            go test -v -count=1 -run "$TF" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          else
+            go test -v -count=1 ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+          echo "===== Test summary ====="
+          awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} END{printf "passed=%d failed=%d skipped=%d\n", p+0, f+0, s+0}' "$RUNNER_TEMP/test.log"
+          grep -E '^(ok|FAIL|\?)[[:space:]]' "$RUNNER_TEMP/test.log"
