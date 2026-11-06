@@ -1037,3 +1037,125 @@ func TestV2FalseMatchZeroVal(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeBlockSwitchSingleBlockType(t *testing.T) {
+	// A block switch is only valid in a category that declares at least two
+	// block types; otherwise it must be reported as a format error (not as
+	// success, and not as a need for more input).
+	s := NewReader(nil)
+	s.block_type_trees = make([]huffmanCode, 3*(huffmanMaxSize258+huffmanMaxSize26))
+	s.block_len_trees = s.block_type_trees[3*huffmanMaxSize258:]
+	decoderStateMetablockBegin(s)
+
+	for _, tc := range []struct {
+		name   string
+		decode func(*Reader) int
+	}{
+		{"literal", decodeLiteralBlockSwitch},
+		{"literal/safe", safeDecodeLiteralBlockSwitch},
+		{"command", decodeCommandBlockSwitch},
+		{"command/safe", safeDecodeCommandBlockSwitch},
+		{"distance", decodeDistanceBlockSwitch},
+		{"distance/safe", safeDecodeDistanceBlockSwitch},
+	} {
+		rb := s.block_type_rb
+		lengths := s.block_length
+		if got := tc.decode(s); got != decoderErrorFormatBlockSwitch {
+			t.Errorf("%s: got result %d, want %d (decoderErrorFormatBlockSwitch)", tc.name, got, decoderErrorFormatBlockSwitch)
+		}
+		if s.block_type_rb != rb || s.block_length != lengths {
+			t.Errorf("%s: rejected block switch modified the decoder state", tc.name)
+		}
+	}
+
+	if got, want := decodeError(decoderErrorFormatBlockSwitch).Error(), "brotli: BLOCK_SWITCH"; got != want {
+		t.Errorf("error string: got %q, want %q", got, want)
+	}
+}
+
+func TestDecodeCommandBlockSwitchSingleBlockType(t *testing.T) {
+	// A meta-block that declares a single insert-and-copy block type gets an
+	// implicit block length of 1<<24 commands. Commands that reference a static
+	// dictionary word through a transform that omits the whole word produce no
+	// output, so they never use up the meta-block length and the block length
+	// can be exhausted. The decoder must then reject the impossible block
+	// switch instead of looping forever without consuming any input.
+	const (
+		numCommands = 1 << 24
+
+		// Insert length 0, copy length 4, explicit distance.
+		cmdCode = 130
+
+		npostfix = 3
+		ndirect  = 0
+
+		// Transform 34 is "" OmitFirst4 "": applied to a 4-byte word it
+		// produces nothing. With nothing written yet, distance
+		// 1 + (34 << 10) addresses word 0 of length 4 under that transform.
+		emptyTransform = 34
+		distance       = 1 + emptyTransform<<10
+
+		// distance - 1 == ((4092 + distExtra) << npostfix): distance symbol
+		// 16 + (20 << npostfix) has 11 extra bits and an offset of 4092.
+		distSymbol    = numDistanceShortCodes + ndirect + 20<<npostfix
+		distExtraBits = 11
+		distExtra     = (distance-1)>>npostfix - 4092
+	)
+
+	if c := kCmdLut[cmdCode]; c.insert_len_offset != 0 || c.insert_len_extra_bits != 0 || c.copy_len_offset != 4 || c.copy_len_extra_bits != 0 || c.distance_code >= 0 {
+		t.Fatalf("command code %d is not insert 0 / copy 4 / explicit distance: %+v", cmdCode, c)
+	}
+	dict := getDictionary()
+	if n := transformDictionaryWord(make([]byte, 64), dict.data[dict.offsets_by_length[4]:], 4, getTransforms(), emptyTransform); n != 0 {
+		t.Fatalf("transform %d of a 4-byte word produced %d bytes, want 0", emptyTransform, n)
+	}
+
+	w := &bitWriter{dst: make([]byte, 0, numCommands*distExtraBits/8+4096)}
+	w.writeBits(1, 0)        // WBITS = 16
+	w.writeBits(1, 1)        // ISLAST
+	w.writeBits(1, 0)        // ISLASTEMPTY
+	w.writeBits(2, 0)        // MNIBBLES = 4
+	w.writeBits(16, 0)       // MLEN = 1
+	w.writeBits(1, 0)        // NBLTYPESL = 1
+	w.writeBits(1, 0)        // NBLTYPESI = 1
+	w.writeBits(1, 0)        // NBLTYPESD = 1
+	w.writeBits(2, npostfix) // NPOSTFIX
+	w.writeBits(4, ndirect)  // NDIRECT
+	w.writeBits(2, 0)        // context mode of literal block type 0
+	w.writeBits(1, 0)        // NTREESL = 1
+	w.writeBits(1, 0)        // NTREESD = 1
+	// Simple prefix codes with a single symbol (HSKIP = 1, NSYM = 1), so
+	// reading any of these symbols takes zero bits.
+	w.writeBits(2, 1)
+	w.writeBits(2, 0)
+	w.writeBits(8, 0) // literal alphabet: 256 symbols
+	w.writeBits(2, 1)
+	w.writeBits(2, 0)
+	w.writeBits(10, cmdCode) // insert-and-copy alphabet: 704 symbols
+	w.writeBits(2, 1)
+	w.writeBits(2, 0)
+	w.writeBits(9, distSymbol) // distance alphabet: 16 + 0 + (48 << 3) = 400 symbols
+	for i := 0; i < numCommands; i++ {
+		w.writeBits(distExtraBits, distExtra)
+	}
+	// Plenty of trailing input, so the decoder is on its fast path when the
+	// command block length runs out.
+	for i := 0; i < 4096; i++ {
+		w.writeBits(8, 0)
+	}
+	w.jumpToByteBoundary()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, NewReader(bytes.NewReader(w.dst)))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != decodeError(decoderErrorFormatBlockSwitch) {
+			t.Fatalf("got error %v, want %v", err, decodeError(decoderErrorFormatBlockSwitch))
+		}
+	case <-time.After(time.Minute):
+		t.Fatal("decoder did not terminate on a block switch with a single block type")
+	}
+}
